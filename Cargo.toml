@@ -1,0 +1,21 @@
+[package]
+name = "ce-crash"
+version = "0.1.0"
+edition = "2021"
+description = "Post-mortem crash capture for every app on the mesh: a wrapper-runner supervises any command and, on abnormal exit, seals a CRASH CAPSULE (exit status, stderr tail, argv, environment manifest) into a content-addressed mesh blob, indexed into ce-debug as an error event carrying its CID. `ce-crash why <app>` answers from any machine."
+license = "AGPL-3.0-only"
+
+[lib]
+name = "ce_crash"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-crash"
+path = "src/main.rs"
+
+[dependencies]
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

@@ -1,46 +1,99 @@
 # ce-crash — post-mortem capture for every app on the mesh
 
-STATUS: DESIGN (repo seeded 2026-07-24; no code yet).
+STATUS: WORKING (v1: wrapper-runner + Python last-words hooks + read CLI).
 
 ## What / why
 
 An app dies at 03:12 on a board in another building. `ce-crash why board-sensor` — from any
-machine — answers with the evidence: exit status, the last seconds of its logs, its environment
-manifest, when, on which node, which build. No ssh, no scrolling journalctl on the wrong machine.
+machine — answers with the evidence: exit status, the last stderr lines or stack trace, its
+environment manifest, when, on which node. No ssh, no scrolling journalctl on the wrong machine.
 
-## Design
+## v1 scope (honest)
 
-**Capture at the supervisor seam.** The node supervisor already observes every app exit. A crash
-reporter (host-composed adapter, not an app patch) triggers on abnormal exit and assembles a
-CRASH CAPSULE:
+The original design captured crashes at the **node supervisor seam** (the supervisor observes
+every app exit). That seam is not available to an app: the substrate is locked, and a supervisor
+crash hook would be a substrate change. Supervisor-seam capture is therefore **v2 — it requires
+its own substrate discussion first**. v1 ships what needs no substrate change and is already
+universal:
 
-- exit status / signal, timestamps (start, exit), restart count
-- the app's tail from ce-debug (last N ring events for that app@node — the suite composes)
-- stderr/stdout tail from the supervisor's log
-- environment manifest: app version/CID, manifest hash, node id, os/arch (node-facts), ce version
-- optional app-provided last-words file (`<data_dir>/apps/<app>/crash.json`, written by SDK
-  panic/exception hooks — the ce-debug clients already capture the stack; this persists it)
+1. **`ce-crash run -- <cmd...>`** — a wrapper-runner that supervises any command. On nonzero
+   exit or death-by-signal it seals a crash capsule. This gives crash capture for ANY app in
+   ANY language with zero code changes: wrap the launch, done.
+2. **SDK last-words hooks** — `clients/py/ce_crash.py` (stdlib-only). `ce_crash.install(app)`
+   arms `sys.excepthook` + an atexit hook; an unhandled exception or `sys.exit(nonzero)` seals
+   a capsule with the exception type, message, and full stack. It wraps the same mesh-call
+   subset the ce-debug Python client uses (vendored, ~60 lines — noted in the file) rather
+   than modifying ce-debug.
+3. **The read CLI** — `ce-crash list` / `ce-crash why <app>`.
 
-The capsule is one JSON blob -> content-addressed mesh blob (CID); the capsule INDEX (app, node,
-ts, CID) is reported into ce-debug as a `level=error` event with `fields.crash_cid` — so crashes
-appear in the normal error stream AND carry their full evidence by reference. Retention scales the
-ce-debug way: capsules are blobs anywhere on the mesh.
+## The crash capsule
 
-**Read side.** `ce-crash why <app> [--node N]` = query ce-debug for the newest crash event, fetch
-the capsule by CID, render. `ce-crash list` groups by fingerprint (same grouping rules). Ability:
-`debug:read` covers the index; capsule blobs inherit blob access (documented sharp edge:
-capsules contain env + log tails — cecapabilities.toml spells out what never to include: secrets,
-identity keys, payload bodies).
+One JSON document, sealed at death:
 
-## Skins
+```json
+{
+  "app": "crash-demo", "node": "", "ts_ms": 1784900000000,
+  "exit_kind": "exit | signal | exception",
+  "exit_code": 1, "signal": null, "exc_type": "RuntimeError",
+  "msg": "RuntimeError: demo crash: sensor voltage out of range",
+  "stack": "Traceback ...",            "stderr_tail": ["last 100 lines ..."],
+  "argv": ["python3", "-c", "..."],    "python": "3.12 ...",
+  "platform": "macos-aarch64",         "cwd": "/where/it/ran",
+  "env_keys": ["HOME", "PATH", "..."],
+  "recent": [ "last 50 ce_debug events this process buffered, if a client was passed" ]
+}
+```
 
-CLI (`why`, `list`); MCP (`crash_why`, `crash_list` — the agent's first move on "it died");
-`<ce-crash-panel>` UI component later; SDK last-words hooks land in the ce-debug clients.
+The capsule is uploaded to the local node's content-addressed blob store (`POST /blobs` ->
+CID). The INDEX is a `level=error` event ingested into the ce-debug service
+([ce-net/ce-debug](https://github.com/ce-net/ce-debug), topic `ce.debug/ctl`) carrying
+`fields.crash_cid` — so crashes appear in the normal error stream (`ce-debug errors` sees
+them too) AND their full evidence is one blob fetch away. Retention scales the ce-debug way:
+capsules are blobs anywhere on the mesh.
 
-## Plan of record
+**Fail-open:** if the node/mesh is down, the capsule is written to
+`~/.local/share/ce/ce-crash/<app>-<ts>.json` and a note is printed on stderr. Crash capture
+never takes the dying app down harder.
 
-1. Supervisor-seam reporter + capsule format + ce-debug indexing.
-2. `why`/`list` CLI + MCP.
-3. Last-words hooks in ce-debug SDKs; UI panel.
+**Privacy:** the capsule records environment variable NAMES only, never values. Sharp edge,
+documented: `argv` and stderr tails are captured verbatim — do not pass secrets on command
+lines you wrap.
 
-Reference: ce-debug (store/wire/grouping), ce-recover (stuck-node playbook), node-facts (env).
+## Usage
+
+```bash
+# Universal capture — any language, zero code changes:
+ce-crash run --app board-sensor -- python3 sensor.py
+ce-crash run -- ./my-service --port 9000        # app name = argv[0] basename
+
+# Python last-words hooks (richer: exception type + stack + recent event tail):
+import ce_crash
+ce_crash.install("board-sensor")                 # optionally: debug=<ce_debug client>
+
+# Forensics, from any machine that can reach a ce.debug provider:
+ce-crash list                                    # crash groups, newest first
+ce-crash list --app board-sensor
+ce-crash why board-sensor                        # newest capsule: what/when/where/stack
+ce-crash why board-sensor --node 2d7fc92f        # filter by node id prefix
+# Common flags: --provider <node-id>  --cap <token>  --json
+```
+
+Auth follows ce-debug: the collector's `--auth` mode governs; pass `--cap` (or
+`CE_DEBUG_CAP`) when the collector requires a capability granting `debug:write` (sealing)
+or `debug:read` (list/why).
+
+## Build / test
+
+```bash
+cargo build --release          # the ce-crash binary
+cargo test                     # capsule build, grouping, render (fixtures)
+python3 clients/py/test_ce_crash.py   # hook + fallback-shape tests (no node needed)
+```
+
+## Roadmap
+
+1. v2: supervisor-seam capture (node observes every app exit) — needs a substrate
+   discussion; not buildable app-side today.
+2. Restart counts + app version/CID in the capsule (node-facts / appmgr metadata).
+3. MCP skin (`crash_why`, `crash_list` — the agent's first move on "it died"); UI panel.
+4. Last-words hooks for the other SDK languages (TS/Go), same capsule shape.
